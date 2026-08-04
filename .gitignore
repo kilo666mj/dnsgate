@@ -1,0 +1,5 @@
+/dnsd
+/dnsgate
+*.db
+*.db-wal
+*.db-shm
