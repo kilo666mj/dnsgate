@@ -30,6 +30,13 @@ type Config struct {
 	// Thresholds tune the operational detectors. These need a threshold
 	// rather than a baseline, which is why they work on day one.
 	Thresholds Thresholds `json:"thresholds"`
+
+	// Webhook, when set, receives every new finding as JSON in addition to
+	// the log. Findings are announced once per client, kind and day, so this
+	// is safe to point at a chat channel — detectors run on every flush, and
+	// without that rule a noisy client would be reported every few minutes.
+	Webhook        string            `json:"webhook,omitempty"`
+	WebhookHeaders map[string]string `json:"webhook_headers,omitempty"`
 }
 
 // Source describes one resolver.
