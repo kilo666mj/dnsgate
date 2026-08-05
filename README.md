@@ -101,8 +101,47 @@ several collectors, which is a problem worth not solving twice.
 
 Nothing here integrates with a private monitoring system, and nothing should.
 If you want dnsgate's findings in one, collect *from* dnsgate — the store
-schema and the daemon's log are both stable to read — rather than teaching
-dnsgate about infrastructure nobody else runs.
+schema, the daemon's log, and the webhook below are all stable to read —
+rather than teaching dnsgate about infrastructure nobody else runs.
+
+## Getting told about findings
+
+The log always gets the finding. A webhook is additional, so a webhook that is
+down costs the integration and not the record:
+
+```json
+"webhook": "https://example/hook",
+"webhook_headers": {"Authorization": "Bearer ..."}
+```
+
+Both implementations are deliberately generic. Anything that knows about a
+particular chat product or ticket tracker belongs outside this repository, and
+the webhook is the seam where that glue attaches.
+
+**A finding is announced once per client, kind and day.** This is the part that
+makes a webhook usable at all. Detectors run on *every flush*, and a finding is
+a state rather than an event — a client over the query-rate threshold is over it
+on every run for the rest of the day. Repeating that in a log is untidy;
+repeating it into a chat channel every few minutes is a flood that gets the
+integration muted, which costs more than never having built it.
+
+The day is the natural granularity: it is already the key the store counts
+against, and *"this client is still noisy today"* is not news whereas *"this
+client is noisy again today"* is.
+
+The ledger of what has been said lives in the **store, not in memory**. dnsd
+restarts for deploys and reboots, and an in-memory ledger would re-announce
+every active finding each time — turning a routine restart into a burst of
+alerts about nothing new. It is keyed by day and pruned alongside the
+observations it refers to.
+
+Two deliberate trade-offs in the failure cases:
+
+- **A finding the notifier drops is not retried**, because it was already
+  marked. A notifier failing intermittently would otherwise produce a duplicate
+  on the next flush for every finding it dropped.
+- **A finding whose ledger write fails is sent anyway.** A duplicate is noise; a
+  dropped finding is the thing dnsgate exists to catch.
 
 ## Identity
 

@@ -21,6 +21,7 @@ import (
 	"github.com/kilo666mj/dnsgate/internal/config"
 	"github.com/kilo666mj/dnsgate/internal/detect"
 	"github.com/kilo666mj/dnsgate/internal/dnsquery"
+	"github.com/kilo666mj/dnsgate/internal/notify"
 	"github.com/kilo666mj/dnsgate/internal/source/technitium"
 	"github.com/kilo666mj/dnsgate/internal/store"
 )
@@ -76,8 +77,22 @@ func run(configPath string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The log always gets the finding. A webhook is additional, so a webhook
+	// that is down costs the integration and not the record.
+	var to notify.Notifier = notify.LogNotifier{Logger: log}
+	if cfg.Webhook != "" {
+		to = notify.Notifiers{
+			notify.LogNotifier{Logger: log},
+			notify.WebhookNotifier{URL: cfg.Webhook, Headers: cfg.WebhookHeaders},
+		}
+	}
+	// Seen is the store, so the ledger of what has already been said survives
+	// a restart. Without that, every deploy re-announces every active finding.
+	reporter := notify.Reporter{To: to, Seen: st, Log: log}
+
 	log.Info("starting", "version", version, "db", st.Path(),
-		"sources", len(sources), "flush", time.Duration(cfg.FlushInterval))
+		"sources", len(sources), "flush", time.Duration(cfg.FlushInterval),
+		"webhook", cfg.Webhook != "")
 
 	agg := aggregate.New()
 	queries := make(chan dnsquery.Query, 4096)
@@ -100,18 +115,18 @@ func run(configPath string, log *slog.Logger) error {
 			if !ok {
 				// Every source has stopped. Flush what is held before
 				// returning, or the last interval is lost.
-				flushOnce(context.WithoutCancel(ctx), agg, st, cfg, log)
+				flushOnce(context.WithoutCancel(ctx), agg, st, reporter, cfg, log)
 				return <-merged
 			}
 			agg.Add(q)
 
 		case <-flush.C:
-			flushOnce(ctx, agg, st, cfg, log)
+			flushOnce(ctx, agg, st, reporter, cfg, log)
 
 		case <-ctx.Done():
 			// Deliberately not ctx: it is already cancelled, and the final
 			// write must still be allowed to reach the disk.
-			flushOnce(context.WithoutCancel(ctx), agg, st, cfg, log)
+			flushOnce(context.WithoutCancel(ctx), agg, st, reporter, cfg, log)
 			log.Info("stopped")
 			return nil
 		}
@@ -147,7 +162,9 @@ func buildSources(cfg config.Config, st *store.Store, log *slog.Logger) ([]dnsqu
 // flushOnce writes accumulated counters, then reports on what is now stored.
 // Errors are logged rather than returned: a transient database problem should
 // not stop collection, and the aggregator keeps the batch for the next try.
-func flushOnce(ctx context.Context, agg *aggregate.Aggregator, st *store.Store, cfg config.Config, log *slog.Logger) {
+func flushOnce(ctx context.Context, agg *aggregate.Aggregator, st *store.Store,
+	reporter notify.Reporter, cfg config.Config, log *slog.Logger,
+) {
 	n, err := agg.Flush(ctx, st)
 	if err != nil {
 		log.Error("flush failed; counters retained for the next attempt", "err", err)
@@ -158,7 +175,7 @@ func flushOnce(ctx context.Context, agg *aggregate.Aggregator, st *store.Store, 
 	}
 	log.Debug("flushed", "buckets", n)
 
-	if err := report(ctx, st, cfg, log); err != nil {
+	if err := report(ctx, st, reporter, cfg); err != nil {
 		log.Error("detector run failed", "err", err)
 	}
 	if cfg.RetainDays > 0 {
@@ -171,14 +188,17 @@ func flushOnce(ctx context.Context, agg *aggregate.Aggregator, st *store.Store, 
 	}
 }
 
-// report runs the operational detectors over today's observations.
+// report runs the operational detectors over today's observations and
+// announces whatever has not been announced already.
 //
-// Findings go to the log. Anything richer belongs behind a notifier interface
-// with generic implementations — a webhook, a chat service — so that dnsgate
-// stays useful to someone who runs none of the same infrastructure. A private
-// monitoring system should read dnsgate rather than dnsgate knowing about it:
-// the store's schema and this log are both stable surfaces to collect from.
-func report(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
+// The notifier implementations are deliberately generic — a log and a webhook.
+// Anything that knows about a particular chat product or monitoring system
+// belongs outside this repository: dnsgate should stay useful to someone
+// running none of the same infrastructure, and the webhook is where their own
+// glue attaches. A private monitoring system should read dnsgate rather than
+// dnsgate knowing about it; the store's schema and the log are both stable
+// surfaces to collect from.
+func report(ctx context.Context, st *store.Store, r notify.Reporter, cfg config.Config) error {
 	today := store.Day(time.Now())
 	rows, err := st.Since(ctx, today)
 	if err != nil {
@@ -190,12 +210,7 @@ func report(ctx context.Context, st *store.Store, cfg config.Config, log *slog.L
 		NXDomainRatio:        cfg.Thresholds.NXDomainRatio,
 		MinQueries:           cfg.Thresholds.MinQueries,
 	})
-	for _, f := range findings {
-		log.Warn(f.Summary,
-			"kind", f.Kind, "client", f.Client.String(), "day", f.Day,
-			"value", f.Value, "threshold", f.Threshold,
-			"queries", f.Queries, "top_domains", f.TopDomains)
-	}
+	r.Report(ctx, findings)
 	return nil
 }
 

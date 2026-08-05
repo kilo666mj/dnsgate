@@ -172,6 +172,19 @@ func (s *Store) init() error {
 			position   TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+
+		// Which findings have already been announced. Detectors run on every
+		// flush and a finding is a state rather than an event, so without this
+		// a noisy client is reported every few minutes for the rest of the
+		// day. Kept in the store rather than in memory because dnsd restarts,
+		// and an in-memory ledger would re-announce everything on each deploy.
+		`CREATE TABLE IF NOT EXISTS reported (
+			kind        TEXT NOT NULL,
+			client      TEXT NOT NULL,
+			day         TEXT NOT NULL,
+			reported_at TEXT NOT NULL,
+			PRIMARY KEY (kind, client, day)
+		)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return err
@@ -314,6 +327,25 @@ func (s *Store) SaveCursor(ctx context.Context, source, position string) error {
 	return err
 }
 
+// MarkReported records that a finding has been announced, and reports whether
+// this call was the one that recorded it.
+//
+// The insert is the test. Checking for the row and then writing it would let
+// two flushes overlapping on a slow detector run both conclude the finding was
+// new and announce it twice; ON CONFLICT DO NOTHING makes the database decide,
+// and RowsAffected says who won.
+func (s *Store) MarkReported(ctx context.Context, kind, client, day string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO reported (kind, client, day, reported_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(kind, client, day) DO NOTHING`,
+		kind, client, day, encodeTime(time.Now()))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // Prune deletes observations older than the given day, bounding growth. The
 // store is counters, so this is cheap and rarely urgent — a year of a busy
 // fleet is thousands of rows, not millions.
@@ -322,7 +354,18 @@ func (s *Store) Prune(ctx context.Context, before string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	pruned, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	// The reported ledger is keyed by the same day, so it is dead weight once
+	// the observations behind it are gone. Not counted in the return value:
+	// the caller logs that number as observations pruned, and folding two
+	// different things into it would make the figure mean nothing.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM reported WHERE day < ?`, before); err != nil {
+		return pruned, err
+	}
+	return pruned, nil
 }
 
 // Day renders a time as the UTC bucket key. Always UTC: a store written in

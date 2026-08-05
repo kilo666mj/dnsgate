@@ -270,3 +270,89 @@ func TestReopenKeepsData(t *testing.T) {
 		t.Errorf("cursor after reopen = %q, want it persisted", got)
 	}
 }
+
+func TestMarkReportedIsOnce(t *testing.T) {
+	s := openTest(t)
+
+	first, err := s.MarkReported(t.Context(), "query-rate", "192.168.1.50", "2026-08-05")
+	if err != nil {
+		t.Fatalf("MarkReported: %v", err)
+	}
+	if !first {
+		t.Fatal("the first mark did not report itself as the one that recorded it")
+	}
+
+	again, err := s.MarkReported(t.Context(), "query-rate", "192.168.1.50", "2026-08-05")
+	if err != nil {
+		t.Fatalf("MarkReported: %v", err)
+	}
+	if again {
+		t.Error("a repeat mark claimed to be new; the finding would be announced twice")
+	}
+
+	// Kind, client and day each distinguish a finding. Deduplication keyed too
+	// coarsely would hide real ones, which is worse than the flood it prevents.
+	for _, tc := range []struct{ kind, client, day string }{
+		{"nxdomain-rate", "192.168.1.50", "2026-08-05"},
+		{"query-rate", "192.168.1.51", "2026-08-05"},
+		{"query-rate", "192.168.1.50", "2026-08-06"},
+	} {
+		fresh, err := s.MarkReported(t.Context(), tc.kind, tc.client, tc.day)
+		if err != nil {
+			t.Fatalf("MarkReported(%v): %v", tc, err)
+		}
+		if !fresh {
+			t.Errorf("MarkReported(%v) was treated as a duplicate", tc)
+		}
+	}
+}
+
+// The whole reason the ledger is in the store rather than in memory: dnsd
+// restarts for deploys and reboots, and an in-memory ledger would re-announce
+// every active finding each time.
+func TestReportedLedgerSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dnsgate.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.MarkReported(t.Context(), "query-rate", "192.168.1.50", "2026-08-05"); err != nil {
+		t.Fatalf("MarkReported: %v", err)
+	}
+	s.Close()
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	fresh, err := reopened.MarkReported(t.Context(), "query-rate", "192.168.1.50", "2026-08-05")
+	if err != nil {
+		t.Fatalf("MarkReported: %v", err)
+	}
+	if fresh {
+		t.Error("a restart re-announced a finding that had already been reported")
+	}
+}
+
+// The ledger is keyed by the same day as the observations, so it must not
+// outlive them.
+func TestPruneClearsTheReportedLedger(t *testing.T) {
+	s := openTest(t)
+
+	if _, err := s.MarkReported(t.Context(), "query-rate", "192.168.1.50", "2026-08-01"); err != nil {
+		t.Fatalf("MarkReported: %v", err)
+	}
+	if _, err := s.Prune(t.Context(), "2026-08-05"); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	fresh, err := s.MarkReported(t.Context(), "query-rate", "192.168.1.50", "2026-08-01")
+	if err != nil {
+		t.Fatalf("MarkReported: %v", err)
+	}
+	if !fresh {
+		t.Error("the reported ledger outlived the observations it refers to")
+	}
+}
