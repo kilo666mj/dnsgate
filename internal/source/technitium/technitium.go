@@ -16,11 +16,13 @@ package technitium
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +66,19 @@ type Config struct {
 
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+
+	// Checkpoint persists the read position. Without one, a restart seeks to
+	// the newest row and silently drops everything that arrived while dnsd
+	// was down — which on a ring that holds a few hours is unrecoverable.
+	Checkpoint Checkpoint
+}
+
+// Checkpoint stores a source's read position across restarts. Declared here
+// rather than in the store so this package depends on nothing but what it
+// uses.
+type Checkpoint interface {
+	Load(ctx context.Context, source string) (string, error)
+	Save(ctx context.Context, source, position string) error
 }
 
 // Source polls one Technitium server.
@@ -109,9 +124,11 @@ func (s *Source) Name() string { return s.cfg.Name }
 // the next tick rather than returned: one unreachable resolver in a pair must
 // not stop collection from the other.
 func (s *Source) Run(ctx context.Context, out chan<- dnsquery.Query) error {
-	// Establish the cursor before the first real poll, so starting dnsd does
-	// not replay the whole retained ring as though it were new activity.
-	if err := s.seek(ctx); err != nil {
+	// Resume where the last run stopped. Only when there is no stored
+	// position do we seek to the newest row — a first start should not
+	// replay the whole retained ring as though it were new activity, but a
+	// restart must not skip the gap either.
+	if err := s.resume(ctx); err != nil {
 		s.log.Warn("could not establish initial cursor; starting from zero", "err", err)
 	}
 
@@ -132,6 +149,26 @@ func (s *Source) Run(ctx context.Context, out chan<- dnsquery.Query) error {
 			}
 		}
 	}
+}
+
+// resume restores the persisted cursor, falling back to seek on a first run.
+func (s *Source) resume(ctx context.Context) error {
+	if s.cfg.Checkpoint != nil {
+		pos, err := s.cfg.Checkpoint.Load(ctx, s.cfg.Name)
+		if err != nil {
+			return fmt.Errorf("load checkpoint: %w", err)
+		}
+		if pos != "" {
+			n, err := strconv.ParseInt(pos, 10, 64)
+			if err != nil {
+				return fmt.Errorf("stored cursor %q: %w", pos, err)
+			}
+			s.cursor = n
+			s.log.Info("resumed from stored cursor", "cursor", n)
+			return nil
+		}
+	}
+	return s.seek(ctx)
 }
 
 // seek moves the cursor to the newest row without emitting anything.
@@ -193,6 +230,16 @@ func (s *Source) poll(ctx context.Context, out chan<- dnsquery.Query) (int, erro
 	}
 	if len(fresh) > 0 {
 		s.cursor = fresh[0].RowNumber
+		if s.cfg.Checkpoint != nil {
+			// Saved after emitting, so a crash mid-poll replays rather than
+			// skips. That is a deliberate trade, not a free one: replayed
+			// rows already flushed will be counted twice, inflating a rate.
+			// A gap is worse — it is silent, permanent once the ring turns
+			// over, and looks exactly like a quiet period.
+			if err := s.cfg.Checkpoint.Save(ctx, s.cfg.Name, strconv.FormatInt(s.cursor, 10)); err != nil {
+				s.log.Warn("could not persist cursor", "err", err)
+			}
+		}
 	}
 	return len(fresh), nil
 }
@@ -244,6 +291,29 @@ func (e entry) toQuery(source string) (dnsquery.Query, error) {
 	}, nil
 }
 
+// redact renders a request URL with the token removed, so a credential never
+// reaches a log line. Query logs are shipped off-host; a token in one is a
+// token in whatever collects them.
+func redact(u *url.URL) string {
+	clone := *u
+	q := clone.Query()
+	if q.Get("token") != "" {
+		q.Set("token", "REDACTED")
+	}
+	clone.RawQuery = q.Encode()
+	return clone.String()
+}
+
+// transportCause strips the *url.Error wrapper, whose Error() prints the URL
+// it was given — including the token.
+func transportCause(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	return err.Error()
+}
+
 type queryResponse struct {
 	PageNumber   int     `json:"pageNumber"`
 	TotalPages   int     `json:"totalPages"`
@@ -273,11 +343,14 @@ func (s *Source) fetch(ctx context.Context, page, perPage int) (queryResponse, e
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return queryResponse{}, err
+		return queryResponse{}, fmt.Errorf("build request for %s: %w", redact(u), err)
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return queryResponse{}, err
+		// The transport puts the full URL in its error, token and all, and
+		// these are logged on every failed poll. Report the redacted form and
+		// unwrap to the underlying cause rather than embedding %w.
+		return queryResponse{}, fmt.Errorf("GET %s: %s", redact(u), transportCause(err))
 	}
 	defer resp.Body.Close()
 
