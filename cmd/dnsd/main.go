@@ -173,9 +173,11 @@ func flushOnce(ctx context.Context, agg *aggregate.Aggregator, st *store.Store, 
 
 // report runs the operational detectors over today's observations.
 //
-// Findings go to the log for now. They belong in fleetglass alongside the rest
-// of the fleet's health rather than in a new alerting surface of their own,
-// which is the next piece of work.
+// Findings go to the log. Anything richer belongs behind a notifier interface
+// with generic implementations — a webhook, a chat service — so that dnsgate
+// stays useful to someone who runs none of the same infrastructure. A private
+// monitoring system should read dnsgate rather than dnsgate knowing about it:
+// the store's schema and this log are both stable surfaces to collect from.
 func report(ctx context.Context, st *store.Store, cfg config.Config, log *slog.Logger) error {
 	today := store.Day(time.Now())
 	rows, err := st.Since(ctx, today)
