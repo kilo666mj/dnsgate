@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -306,5 +307,36 @@ func TestNewValidatesConfig(t *testing.T) {
 	}
 	if s.cfg.PollInterval != DefaultPollInterval {
 		t.Errorf("poll interval = %v, want default", s.cfg.PollInterval)
+	}
+}
+
+// A token must never reach a log line. Poll failures are logged on every
+// cycle, and those logs get shipped off-host — a token in one is a token in
+// whatever collects them.
+func TestErrorsDoNotLeakTheToken(t *testing.T) {
+	// Nothing listening, so the transport error carries the full request URL.
+	s, err := New(Config{Name: "n", BaseURL: "http://127.0.0.1:59999", Token: "super-secret-token"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, pollErr := s.poll(t.Context(), make(chan dnsquery.Query, 1))
+	if pollErr == nil {
+		t.Fatal("want an error against a dead port")
+	}
+	msg := pollErr.Error()
+	if strings.Contains(msg, "super-secret-token") {
+		t.Errorf("error leaks the token: %s", msg)
+	}
+	if !strings.Contains(msg, "REDACTED") {
+		t.Errorf("error should show the redacted URL, got: %s", msg)
+	}
+
+	// And the seek path, which runs before the first poll.
+	seekErr := s.seek(t.Context())
+	if seekErr == nil {
+		t.Fatal("want an error from seek")
+	}
+	if strings.Contains(seekErr.Error(), "super-secret-token") {
+		t.Errorf("seek error leaks the token: %s", seekErr)
 	}
 }
