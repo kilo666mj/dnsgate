@@ -85,6 +85,25 @@ Worth knowing if you write another source, because they generalise:
 - **A bad token returns HTTP 200** with a `status` field, so it looks like
   success at the transport layer.
 
+## Where verdicts will live
+
+Phase 1 keeps observations locally: `(client, domain, day) → counters`, which
+is a time series and has no verdict in it.
+
+Verdicts — approved, blocked, pending on a domain — belong in
+[`gatehub`](https://github.com/kilo666mj/gatehub), the same store `sshgate` and
+`tlsgate` already push to. Its `fingerprints` table keys on an opaque string
+with a `kind` discriminator and a metadata bag, so a domain fits as
+`kind="dnsgate"` with no schema change, and
+[`gatekit`](https://github.com/kilo666mj/gatekit)'s control-plane client is
+already the wire protocol. That also solves reconciling verdicts across
+several collectors, which is a problem worth not solving twice.
+
+Nothing here integrates with a private monitoring system, and nothing should.
+If you want dnsgate's findings in one, collect *from* dnsgate — the store
+schema and the daemon's log are both stable to read — rather than teaching
+dnsgate about infrastructure nobody else runs.
+
 ## Identity
 
 The key is `client_ip`, and **names are display only**.
