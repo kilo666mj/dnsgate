@@ -44,7 +44,7 @@ func TestDomain(t *testing.T) {
 		// their own identity rather than all collapsing together.
 		"swarm.internal":      "swarm.internal",
 		"puppet.internal":     "puppet.internal",
-		"mx.michaelspost.com": "michaelspost.com",
+		"mx.example.co.uk":    "example.co.uk",
 		// No registrable form: returned as-is, and Classify keeps them out of
 		// the baseline.
 		"swarm":                    "swarm",
