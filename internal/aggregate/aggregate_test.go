@@ -42,9 +42,9 @@ func TestDomain(t *testing.T) {
 		"foo.bar.co.uk": "bar.co.uk",
 		// An unlisted TLD is treated as the suffix, so ".internal" names keep
 		// their own identity rather than all collapsing together.
-		"swarm.internal":      "swarm.internal",
-		"puppet.internal":     "puppet.internal",
-		"mx.example.co.uk":    "example.co.uk",
+		"swarm.internal":   "swarm.internal",
+		"puppet.internal":  "puppet.internal",
+		"mx.example.co.uk": "example.co.uk",
 		// No registrable form: returned as-is, and Classify keeps them out of
 		// the baseline.
 		"swarm":                    "swarm",
